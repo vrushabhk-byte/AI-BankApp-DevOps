@@ -11,6 +11,9 @@ pipeline {
         K8S_CONTAINER = 'bankapp'
         K8S_SERVICE = 'bankapp'
 
+        SONAR_PROJECT_KEY = 'ai-bankapp-devops'
+        SONAR_SERVER = 'SonarQube-Local'
+
         TRIVY_SEVERITY = 'HIGH,CRITICAL'
         TRIVY_REPORT_DIR = 'reports'
     }
@@ -42,6 +45,40 @@ pipeline {
             }
         }
 
+        stage('SonarQube Analysis') {
+            steps {
+                echo 'Running SonarQube code quality analysis...'
+
+                withSonarQubeEnv("${SONAR_SERVER}") {
+                    sh '''
+                        set -eu
+
+                        ./mvnw sonar:sonar \
+                            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+                            -Dsonar.projectName="AI-BankApp-DevOps"
+                    '''
+                }
+            }
+        }
+
+        stage('SonarQube Quality Gate') {
+            steps {
+                echo 'Waiting for SonarQube Quality Gate result...'
+
+                timeout(time: 10, unit: 'MINUTES') {
+                    script {
+                        def qualityGate = waitForQualityGate()
+
+                        echo "SonarQube Quality Gate: ${qualityGate.status}"
+
+                        if (qualityGate.status != 'OK') {
+                            error "SonarQube Quality Gate failed: ${qualityGate.status}"
+                        }
+                    }
+                }
+            }
+        }
+
         stage('Trivy Filesystem Security Scan') {
             steps {
                 echo 'Scanning project dependencies for HIGH and CRITICAL vulnerabilities...'
@@ -51,7 +88,6 @@ pipeline {
 
                     mkdir -p "${TRIVY_REPORT_DIR}"
 
-                    # Generate JSON report without stopping the pipeline.
                     trivy fs \
                         --config trivy.yaml \
                         --scanners vuln \
@@ -61,7 +97,6 @@ pipeline {
                         --exit-code 0 \
                         .
 
-                    # Enforce the security gate.
                     trivy fs \
                         --config trivy.yaml \
                         --scanners vuln \
@@ -108,7 +143,6 @@ pipeline {
 
                     mkdir -p "${TRIVY_REPORT_DIR}"
 
-                    # Generate JSON report.
                     trivy image \
                         --config trivy.yaml \
                         --scanners vuln,secret \
@@ -118,7 +152,6 @@ pipeline {
                         --exit-code 0 \
                         ${DOCKER_IMAGE}:${DOCKER_TAG}
 
-                    # Enforce the vulnerability security gate.
                     trivy image \
                         --config trivy.yaml \
                         --scanners vuln,secret \
@@ -242,13 +275,14 @@ pipeline {
             Docker image: ${DOCKER_IMAGE}:${DOCKER_TAG}
             Kubernetes namespace: ${K8S_NAMESPACE}
             Deployment: ${K8S_DEPLOYMENT}
-            Security scans: PASSED
+            SonarQube Quality Gate: PASSED
+            Trivy security scans: PASSED
             ==========================================
             """
         }
 
         failure {
-            echo 'CI/CD pipeline failed. Check the stage logs and security reports.'
+            echo 'CI/CD pipeline failed. Check the stage logs, SonarQube analysis and security reports.'
         }
 
         always {
