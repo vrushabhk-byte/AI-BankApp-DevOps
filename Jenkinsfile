@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         DOCKER_IMAGE = 'ai-bankapp'
-        DOCKER_TAG = 'ci-${BUILD_NUMBER}'
+        DOCKER_TAG = "ci-${BUILD_NUMBER}"
     }
 
     options {
