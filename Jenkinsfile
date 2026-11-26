@@ -1,11 +1,18 @@
 pipeline {
     agent any
 
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 40, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
     environment {
         DOCKER_IMAGE = 'ai-bankapp'
         DOCKER_TAG = "ci-${BUILD_NUMBER}"
 
-        KIND_CLUSTER = 'aws-devops-local'
+        K8S_CLUSTER = 'aws-devops-local'
         K8S_NAMESPACE = 'bankapp'
         K8S_DEPLOYMENT = 'bankapp'
         K8S_CONTAINER = 'bankapp'
@@ -18,17 +25,19 @@ pipeline {
         TRIVY_REPORT_DIR = 'reports'
     }
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-    }
-
     stages {
 
         stage('Checkout') {
             steps {
                 echo 'Checking out source code...'
+
                 checkout scm
+
+                sh '''
+                    set -eu
+                    echo "Git revision:"
+                    git rev-parse --short=7 HEAD
+                '''
             }
         }
 
@@ -40,6 +49,7 @@ pipeline {
                     set -eu
 
                     chmod +x mvnw
+
                     ./mvnw clean verify -B
                 '''
             }
@@ -53,7 +63,8 @@ pipeline {
                     sh '''
                         set -eu
 
-                        ./mvnw sonar:sonar \
+                        ./mvnw \
+                            org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
                             -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
                             -Dsonar.projectName="AI-BankApp-DevOps"
                     '''
@@ -93,7 +104,7 @@ pipeline {
                         --scanners vuln \
                         --severity "${TRIVY_SEVERITY}" \
                         --format json \
-                        --output "${TRIVY_REPORT_DIR}/trivy-filesystem.json" \
+                        --output "${TRIVY_REPORT_DIR}/filesystem-report.json" \
                         --exit-code 0 \
                         .
 
@@ -115,8 +126,15 @@ pipeline {
                     set -eu
 
                     docker build \
-                        -t ${DOCKER_IMAGE}:${DOCKER_TAG} \
-                        -t ${DOCKER_IMAGE}:latest .
+                        -t "${DOCKER_IMAGE}:${DOCKER_TAG}" \
+                        -t "${DOCKER_IMAGE}:latest" \
+                        .
+
+                    echo "Docker image build completed."
+
+                    docker image inspect "${DOCKER_IMAGE}:${DOCKER_TAG}"
+
+                    docker images "${DOCKER_IMAGE}"
                 '''
             }
         }
@@ -128,8 +146,17 @@ pipeline {
                 sh '''
                     set -eu
 
-                    docker image inspect ${DOCKER_IMAGE}:${DOCKER_TAG}
-                    docker images ${DOCKER_IMAGE}
+                    docker image inspect \
+                        "${DOCKER_IMAGE}:${DOCKER_TAG}" \
+                        --format='Image ID: {{.Id}}'
+
+                    docker image inspect \
+                        "${DOCKER_IMAGE}:${DOCKER_TAG}" \
+                        --format='Image size: {{.Size}} bytes'
+
+                    docker image inspect "${DOCKER_IMAGE}:${DOCKER_TAG}" >/dev/null
+
+                    echo "Docker image validation successful."
                 '''
             }
         }
@@ -148,16 +175,16 @@ pipeline {
                         --scanners vuln,secret \
                         --severity "${TRIVY_SEVERITY}" \
                         --format json \
-                        --output "${TRIVY_REPORT_DIR}/trivy-image.json" \
+                        --output "${TRIVY_REPORT_DIR}/image-report.json" \
                         --exit-code 0 \
-                        ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        "${DOCKER_IMAGE}:${DOCKER_TAG}"
 
                     trivy image \
                         --config trivy.yaml \
                         --scanners vuln,secret \
                         --severity "${TRIVY_SEVERITY}" \
                         --exit-code 1 \
-                        ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        "${DOCKER_IMAGE}:${DOCKER_TAG}"
                 '''
             }
         }
@@ -170,8 +197,8 @@ pipeline {
                     set -eu
 
                     kind load docker-image \
-                        ${DOCKER_IMAGE}:${DOCKER_TAG} \
-                        --name ${KIND_CLUSTER}
+                        "${DOCKER_IMAGE}:${DOCKER_TAG}" \
+                        --name "${K8S_CLUSTER}"
                 '''
             }
         }
@@ -184,9 +211,9 @@ pipeline {
                     set -eu
 
                     kubectl set image \
-                        deployment/${K8S_DEPLOYMENT} \
-                        ${K8S_CONTAINER}=${DOCKER_IMAGE}:${DOCKER_TAG} \
-                        -n ${K8S_NAMESPACE}
+                        deployment/"${K8S_DEPLOYMENT}" \
+                        "${K8S_CONTAINER}"="${DOCKER_IMAGE}:${DOCKER_TAG}" \
+                        -n "${K8S_NAMESPACE}"
                 '''
             }
         }
@@ -199,11 +226,13 @@ pipeline {
                     set -eu
 
                     kubectl rollout status \
-                        deployment/${K8S_DEPLOYMENT} \
-                        -n ${K8S_NAMESPACE} \
+                        deployment/"${K8S_DEPLOYMENT}" \
+                        -n "${K8S_NAMESPACE}" \
                         --timeout=240s
 
-                    kubectl get pods -n ${K8S_NAMESPACE}
+                    echo "Current Kubernetes pods:"
+
+                    kubectl get pods -n "${K8S_NAMESPACE}"
                 '''
             }
         }
@@ -215,52 +244,56 @@ pipeline {
                 sh '''
                     set -eu
 
-                    PORT=18082
-                    LOG_FILE=$(mktemp)
-
-                    kubectl port-forward \
-                        -n ${K8S_NAMESPACE} \
-                        service/${K8S_SERVICE} \
-                        ${PORT}:8080 > "$LOG_FILE" 2>&1 &
-
-                    PF_PID=$!
+                    PORT_FORWARD_LOG=$(mktemp)
+                    HEALTHY=false
 
                     cleanup() {
-                        kill "$PF_PID" 2>/dev/null || true
-                        rm -f "$LOG_FILE"
+                        if [ -n "${PORT_FORWARD_PID:-}" ]; then
+                            kill "${PORT_FORWARD_PID}" 2>/dev/null || true
+                        fi
+
+                        rm -f "${PORT_FORWARD_LOG}" /tmp/bankapp-health.json
                     }
 
                     trap cleanup EXIT
 
-                    HEALTHY=false
+                    kubectl port-forward \
+                        service/"${K8S_SERVICE}" \
+                        18082:8080 \
+                        -n "${K8S_NAMESPACE}" \
+                        >"${PORT_FORWARD_LOG}" 2>&1 &
 
-                    for i in $(seq 1 30); do
+                    PORT_FORWARD_PID=$!
+
+                    for attempt in $(seq 1 30); do
                         if curl -fsS \
-                            http://127.0.0.1:${PORT}/actuator/health \
+                            http://127.0.0.1:18082/actuator/health \
                             -o /tmp/bankapp-health.json; then
 
-                            if grep -q '"status":"UP"' \
-                                /tmp/bankapp-health.json; then
-
+                            if grep -q '"status":"UP"' /tmp/bankapp-health.json; then
                                 HEALTHY=true
                                 break
                             fi
                         fi
 
+                        if ! kill -0 "${PORT_FORWARD_PID}" 2>/dev/null; then
+                            echo "kubectl port-forward process stopped."
+                            cat "${PORT_FORWARD_LOG}"
+                            exit 1
+                        fi
+
                         sleep 2
                     done
 
-                    if [ "$HEALTHY" != "true" ]; then
+                    if [ "${HEALTHY}" != "true" ]; then
                         echo "Application health check failed."
-                        cat "$LOG_FILE"
-                        cat /tmp/bankapp-health.json 2>/dev/null || true
+                        cat "${PORT_FORWARD_LOG}"
                         exit 1
                     fi
 
                     echo "Application health check successful!"
-                    cat /tmp/bankapp-health.json
 
-                    rm -f /tmp/bankapp-health.json
+                    cat /tmp/bankapp-health.json
                 '''
             }
         }
@@ -287,7 +320,7 @@ pipeline {
 
         always {
             archiveArtifacts(
-                artifacts: 'reports/trivy-*.json',
+                artifacts: 'reports/*.json',
                 allowEmptyArchive: true,
                 fingerprint: true
             )
