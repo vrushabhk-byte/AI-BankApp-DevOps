@@ -1,10 +1,17 @@
-cache:
-  dir: ~/.cache/trivy
-
 db:
   no-progress: false
-  
+
+scan:
+  scanners:
+    - vuln
+    - secret
+
+severity:
+  - HIGH
+  - CRITICAL
+
 vulnerability:
   ignore-unfixed: true
-  severity:
-    - CRITICAL
+
+exit-code: 0
+format: table

@@ -10,6 +10,9 @@ pipeline {
         K8S_DEPLOYMENT = 'bankapp'
         K8S_CONTAINER = 'bankapp'
         K8S_SERVICE = 'bankapp'
+
+        TRIVY_SEVERITY = 'HIGH,CRITICAL'
+        TRIVY_REPORT_DIR = 'reports'
     }
 
     options {
@@ -31,8 +34,40 @@ pipeline {
                 echo 'Building and testing Spring Boot application...'
 
                 sh '''
+                    set -eu
+
                     chmod +x mvnw
                     ./mvnw clean verify -B
+                '''
+            }
+        }
+
+        stage('Trivy Filesystem Security Scan') {
+            steps {
+                echo 'Scanning project dependencies for HIGH and CRITICAL vulnerabilities...'
+
+                sh '''
+                    set -eu
+
+                    mkdir -p "${TRIVY_REPORT_DIR}"
+
+                    # Generate JSON report without stopping the pipeline.
+                    trivy fs \
+                        --config trivy.yaml \
+                        --scanners vuln \
+                        --severity "${TRIVY_SEVERITY}" \
+                        --format json \
+                        --output "${TRIVY_REPORT_DIR}/trivy-filesystem.json" \
+                        --exit-code 0 \
+                        .
+
+                    # Enforce the security gate.
+                    trivy fs \
+                        --config trivy.yaml \
+                        --scanners vuln \
+                        --severity "${TRIVY_SEVERITY}" \
+                        --exit-code 1 \
+                        .
                 '''
             }
         }
@@ -42,6 +77,8 @@ pipeline {
                 echo 'Building Docker image...'
 
                 sh '''
+                    set -eu
+
                     docker build \
                         -t ${DOCKER_IMAGE}:${DOCKER_TAG} \
                         -t ${DOCKER_IMAGE}:latest .
@@ -54,8 +91,40 @@ pipeline {
                 echo 'Validating Docker image...'
 
                 sh '''
+                    set -eu
+
                     docker image inspect ${DOCKER_IMAGE}:${DOCKER_TAG}
                     docker images ${DOCKER_IMAGE}
+                '''
+            }
+        }
+
+        stage('Trivy Docker Image Security Scan') {
+            steps {
+                echo 'Scanning Docker image for vulnerabilities and secrets...'
+
+                sh '''
+                    set -eu
+
+                    mkdir -p "${TRIVY_REPORT_DIR}"
+
+                    # Generate JSON report.
+                    trivy image \
+                        --config trivy.yaml \
+                        --scanners vuln,secret \
+                        --severity "${TRIVY_SEVERITY}" \
+                        --format json \
+                        --output "${TRIVY_REPORT_DIR}/trivy-image.json" \
+                        --exit-code 0 \
+                        ${DOCKER_IMAGE}:${DOCKER_TAG}
+
+                    # Enforce the vulnerability security gate.
+                    trivy image \
+                        --config trivy.yaml \
+                        --scanners vuln,secret \
+                        --severity "${TRIVY_SEVERITY}" \
+                        --exit-code 1 \
+                        ${DOCKER_IMAGE}:${DOCKER_TAG}
                 '''
             }
         }
@@ -65,6 +134,8 @@ pipeline {
                 echo 'Loading Docker image into Kubernetes cluster...'
 
                 sh '''
+                    set -eu
+
                     kind load docker-image \
                         ${DOCKER_IMAGE}:${DOCKER_TAG} \
                         --name ${KIND_CLUSTER}
@@ -77,6 +148,8 @@ pipeline {
                 echo 'Deploying BankApp to Kubernetes...'
 
                 sh '''
+                    set -eu
+
                     kubectl set image \
                         deployment/${K8S_DEPLOYMENT} \
                         ${K8S_CONTAINER}=${DOCKER_IMAGE}:${DOCKER_TAG} \
@@ -90,6 +163,8 @@ pipeline {
                 echo 'Waiting for Kubernetes rollout...'
 
                 sh '''
+                    set -eu
+
                     kubectl rollout status \
                         deployment/${K8S_DEPLOYMENT} \
                         -n ${K8S_NAMESPACE} \
@@ -160,22 +235,29 @@ pipeline {
 
     post {
         success {
-            echo '''
+            echo """
             ==========================================
                  CI/CD PIPELINE COMPLETED
             ==========================================
             Docker image: ${DOCKER_IMAGE}:${DOCKER_TAG}
             Kubernetes namespace: ${K8S_NAMESPACE}
             Deployment: ${K8S_DEPLOYMENT}
+            Security scans: PASSED
             ==========================================
-            '''
+            """
         }
 
         failure {
-            echo 'CI/CD pipeline failed. Check the stage logs.'
+            echo 'CI/CD pipeline failed. Check the stage logs and security reports.'
         }
 
         always {
+            archiveArtifacts(
+                artifacts: 'reports/trivy-*.json',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
             echo 'Pipeline execution finished.'
         }
     }
