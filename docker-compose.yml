@@ -21,8 +21,6 @@ services:
   ollama:
     image: ollama/ollama
     container_name: bankapp-ollama
-    ports:
-      - "11434:11434"
     volumes:
       - ollama-data:/root/.ollama
     healthcheck:
@@ -37,7 +35,7 @@ services:
     image: ollama/ollama
     container_name: ollama-pull-model
     environment:
-      - OLLAMA_HOST=ollama
+      OLLAMA_HOST: http://ollama:11434
     volumes:
       - ollama-data:/root/.ollama
     depends_on:
