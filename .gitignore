@@ -56,5 +56,6 @@ trivy-image-report.json
 *.tfstate
 *.tfstate.*
 *.tfplan
+tfplan
 terraform.tfvars
 terraform.tfvars.json
