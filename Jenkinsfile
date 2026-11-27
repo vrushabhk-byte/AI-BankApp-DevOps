@@ -45,6 +45,35 @@ pipeline {
             }
         }
 
+        stage('Terraform Validation') {
+            steps {
+                echo 'Validating Terraform Kubernetes configuration...'
+
+                dir('terraform/kubernetes') {
+                    sh '''
+                        set -eu
+
+                        echo "===== TERRAFORM VERSION ====="
+                        terraform version
+
+                        echo "===== TERRAFORM FORMATTING ====="
+                        terraform fmt -check -recursive
+
+                        echo "===== TERRAFORM INITIALIZATION ====="
+                        terraform init \
+                            -backend=false \
+                            -input=false \
+                            -no-color
+
+                        echo "===== TERRAFORM VALIDATION ====="
+                        terraform validate -no-color
+
+                        echo "Terraform validation completed successfully."
+                    '''
+                }
+            }
+        }
+
         stage('Build and Test') {
             steps {
                 echo 'Building and testing Spring Boot application...'
@@ -356,6 +385,7 @@ pipeline {
             Deployment: ${K8S_DEPLOYMENT}
             SonarQube Quality Gate: PASSED
             Trivy security scans: PASSED
+            Terraform validation: PASSED
             Deployment Health: PASSED
             ==========================================
             """
