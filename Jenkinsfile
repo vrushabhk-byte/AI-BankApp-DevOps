@@ -18,6 +18,9 @@ pipeline {
         K8S_CONTAINER = 'bankapp'
         K8S_SERVICE = 'bankapp'
 
+        PREVIOUS_IMAGE = ''
+        DEPLOYMENT_ATTEMPTED = 'false'
+
         SONAR_PROJECT_KEY = 'ai-bankapp-devops'
         SONAR_SERVER = 'SonarQube-Local'
 
@@ -47,9 +50,7 @@ pipeline {
 
                 sh '''
                     set -eu
-
                     chmod +x mvnw
-
                     ./mvnw clean verify -B
                 '''
             }
@@ -92,7 +93,7 @@ pipeline {
 
         stage('Trivy Filesystem Security Scan') {
             steps {
-                echo 'Scanning project dependencies for HIGH and CRITICAL vulnerabilities...'
+                echo 'Scanning project dependencies...'
 
                 sh '''
                     set -eu
@@ -129,8 +130,6 @@ pipeline {
                         -t "${DOCKER_IMAGE}:${DOCKER_TAG}" \
                         -t "${DOCKER_IMAGE}:latest" \
                         .
-
-                    echo "Docker image build completed."
 
                     docker image inspect "${DOCKER_IMAGE}:${DOCKER_TAG}"
 
@@ -203,18 +202,50 @@ pipeline {
             }
         }
 
+        stage('Capture Previous Deployment') {
+            steps {
+                echo 'Capturing currently deployed image for rollback...'
+
+                script {
+                    def previousImage = sh(
+                        script: """
+                            kubectl get deployment/${K8S_DEPLOYMENT} \
+                                -n ${K8S_NAMESPACE} \
+                                -o jsonpath='{.spec.template.spec.containers[?(@.name=="${K8S_CONTAINER}")].image}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (!previousImage) {
+                        error 'Unable to identify the currently deployed image. Aborting deployment.'
+                    }
+
+                    env.PREVIOUS_IMAGE = previousImage
+                    env.DEPLOYMENT_ATTEMPTED = 'false'
+
+                    echo "Previous deployed image: ${env.PREVIOUS_IMAGE}"
+                }
+            }
+        }
+
         stage('Deploy to Kubernetes') {
             steps {
-                echo 'Deploying BankApp to Kubernetes...'
+                echo 'Deploying new BankApp image...'
 
-                sh '''
-                    set -eu
+                script {
+                    env.DEPLOYMENT_ATTEMPTED = 'true'
 
-                    kubectl set image \
-                        deployment/"${K8S_DEPLOYMENT}" \
-                        "${K8S_CONTAINER}"="${DOCKER_IMAGE}:${DOCKER_TAG}" \
-                        -n "${K8S_NAMESPACE}"
-                '''
+                    sh '''
+                        set -eu
+
+                        kubectl set image \
+                            deployment/"${K8S_DEPLOYMENT}" \
+                            "${K8S_CONTAINER}"="${DOCKER_IMAGE}:${DOCKER_TAG}" \
+                            -n "${K8S_NAMESPACE}"
+
+                        echo "New image deployed: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                    '''
+                }
             }
         }
 
@@ -246,9 +277,10 @@ pipeline {
 
                     PORT_FORWARD_LOG=$(mktemp)
                     HEALTHY=false
+                    PORT_FORWARD_PID=""
 
                     cleanup() {
-                        if [ -n "${PORT_FORWARD_PID:-}" ]; then
+                        if [ -n "${PORT_FORWARD_PID}" ]; then
                             kill "${PORT_FORWARD_PID}" 2>/dev/null || true
                         fi
 
@@ -266,6 +298,7 @@ pipeline {
                     PORT_FORWARD_PID=$!
 
                     for attempt in $(seq 1 30); do
+
                         if curl -fsS \
                             http://127.0.0.1:18082/actuator/health \
                             -o /tmp/bankapp-health.json; then
@@ -300,6 +333,7 @@ pipeline {
     }
 
     post {
+
         success {
             echo """
             ==========================================
@@ -310,12 +344,75 @@ pipeline {
             Deployment: ${K8S_DEPLOYMENT}
             SonarQube Quality Gate: PASSED
             Trivy security scans: PASSED
+            Deployment Health: PASSED
             ==========================================
             """
         }
 
         failure {
-            echo 'CI/CD pipeline failed. Check the stage logs, SonarQube analysis and security reports.'
+            echo 'CI/CD pipeline failed.'
+
+            script {
+                if (
+                    env.DEPLOYMENT_ATTEMPTED == 'true' &&
+                    env.PREVIOUS_IMAGE?.trim()
+                ) {
+
+                    echo """
+                    ==========================================
+                         AUTOMATIC ROLLBACK STARTED
+                    ==========================================
+                    Restoring previous image:
+                    ${env.PREVIOUS_IMAGE}
+                    ==========================================
+                    """
+
+                    int rollbackStatus = sh(
+                        returnStatus: true,
+                        script: '''
+                            set -eu
+
+                            kubectl set image \
+                                deployment/"${K8S_DEPLOYMENT}" \
+                                "${K8S_CONTAINER}"="${PREVIOUS_IMAGE}" \
+                                -n "${K8S_NAMESPACE}"
+
+                            kubectl rollout status \
+                                deployment/"${K8S_DEPLOYMENT}" \
+                                -n "${K8S_NAMESPACE}" \
+                                --timeout=240s
+
+                            echo "Rollback deployment status:"
+                            kubectl get deployment "${K8S_DEPLOYMENT}" \
+                                -n "${K8S_NAMESPACE}"
+
+                            echo "Rollback pod status:"
+                            kubectl get pods -n "${K8S_NAMESPACE}"
+                        '''
+                    )
+
+                    if (rollbackStatus == 0) {
+                        echo """
+                        ==========================================
+                         AUTOMATIC ROLLBACK COMPLETED
+                        ==========================================
+                        Restored image: ${env.PREVIOUS_IMAGE}
+                        ==========================================
+                        """
+                    } else {
+                        echo """
+                        ==========================================
+                         AUTOMATIC ROLLBACK FAILED
+                        ==========================================
+                        Manual investigation is required.
+                        ==========================================
+                        """
+                    }
+
+                } else {
+                    echo 'Rollback skipped: deployment was not attempted or previous image was unavailable.'
+                }
+            }
         }
 
         always {
