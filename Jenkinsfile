@@ -18,9 +18,6 @@ pipeline {
         K8S_CONTAINER = 'bankapp'
         K8S_SERVICE = 'bankapp'
 
-        PREVIOUS_IMAGE = ''
-        DEPLOYMENT_ATTEMPTED = 'false'
-
         SONAR_PROJECT_KEY = 'ai-bankapp-devops'
         SONAR_SERVER = 'SonarQube-Local'
 
@@ -38,6 +35,10 @@ pipeline {
 
                 sh '''
                     set -eu
+
+                    rm -f .rollback-previous-image
+                    rm -f .deployment-attempted
+
                     echo "Git revision:"
                     git rev-parse --short=7 HEAD
                 '''
@@ -209,21 +210,25 @@ pipeline {
                 script {
                     def previousImage = sh(
                         script: """
-                            kubectl get deployment/${K8S_DEPLOYMENT} \
+                            kubectl get deployment ${K8S_DEPLOYMENT} \
                                 -n ${K8S_NAMESPACE} \
-                                -o jsonpath='{.spec.template.spec.containers[?(@.name=="${K8S_CONTAINER}")].image}'
+                                -o go-template='{{(index .spec.template.spec.containers 0).image}}'
                         """,
                         returnStdout: true
                     ).trim()
 
-                    if (!previousImage) {
+                    echo "Captured previous image: [${previousImage}]"
+
+                    if (!previousImage || previousImage == 'null') {
                         error 'Unable to identify the currently deployed image. Aborting deployment.'
                     }
 
-                    env.PREVIOUS_IMAGE = previousImage
-                    env.DEPLOYMENT_ATTEMPTED = 'false'
+                    writeFile(
+                        file: '.rollback-previous-image',
+                        text: previousImage
+                    )
 
-                    echo "Previous deployed image: ${env.PREVIOUS_IMAGE}"
+                    echo "Previous deployment image saved: ${previousImage}"
                 }
             }
         }
@@ -233,7 +238,14 @@ pipeline {
                 echo 'Deploying new BankApp image...'
 
                 script {
-                    env.DEPLOYMENT_ATTEMPTED = 'true'
+                    // Create marker before attempting deployment.
+                    // The post-failure handler uses this to decide
+                    // whether rollback is necessary.
+
+                    writeFile(
+                        file: '.deployment-attempted',
+                        text: 'true'
+                    )
 
                     sh '''
                         set -eu
@@ -353,60 +365,79 @@ pipeline {
             echo 'CI/CD pipeline failed.'
 
             script {
-                if (
-                    env.DEPLOYMENT_ATTEMPTED == 'true' &&
-                    env.PREVIOUS_IMAGE?.trim()
-                ) {
+                boolean deploymentAttempted =
+                    fileExists('.deployment-attempted')
 
-                    echo """
-                    ==========================================
-                         AUTOMATIC ROLLBACK STARTED
-                    ==========================================
-                    Restoring previous image:
-                    ${env.PREVIOUS_IMAGE}
-                    ==========================================
-                    """
+                boolean previousImageAvailable =
+                    fileExists('.rollback-previous-image')
 
-                    int rollbackStatus = sh(
-                        returnStatus: true,
-                        script: '''
-                            set -eu
+                if (deploymentAttempted && previousImageAvailable) {
 
-                            kubectl set image \
-                                deployment/"${K8S_DEPLOYMENT}" \
-                                "${K8S_CONTAINER}"="${PREVIOUS_IMAGE}" \
-                                -n "${K8S_NAMESPACE}"
+                    def previousImage = readFile(
+                        file: '.rollback-previous-image'
+                    ).trim()
 
-                            kubectl rollout status \
-                                deployment/"${K8S_DEPLOYMENT}" \
-                                -n "${K8S_NAMESPACE}" \
-                                --timeout=240s
+                    if (previousImage) {
 
-                            echo "Rollback deployment status:"
-                            kubectl get deployment "${K8S_DEPLOYMENT}" \
-                                -n "${K8S_NAMESPACE}"
-
-                            echo "Rollback pod status:"
-                            kubectl get pods -n "${K8S_NAMESPACE}"
-                        '''
-                    )
-
-                    if (rollbackStatus == 0) {
                         echo """
                         ==========================================
-                         AUTOMATIC ROLLBACK COMPLETED
+                             AUTOMATIC ROLLBACK STARTED
                         ==========================================
-                        Restored image: ${env.PREVIOUS_IMAGE}
+                        Restoring previous image:
+                        ${previousImage}
                         ==========================================
                         """
+
+                        int rollbackStatus = sh(
+                            returnStatus: true,
+                            script: """
+                                set -eu
+
+                                kubectl set image \
+                                    deployment/"${K8S_DEPLOYMENT}" \
+                                    "${K8S_CONTAINER}"="${previousImage}" \
+                                    -n "${K8S_NAMESPACE}"
+
+                                kubectl rollout status \
+                                    deployment/"${K8S_DEPLOYMENT}" \
+                                    -n "${K8S_NAMESPACE}" \
+                                    --timeout=240s
+
+                                echo "Rollback deployment status:"
+
+                                kubectl get deployment "${K8S_DEPLOYMENT}" \
+                                    -n "${K8S_NAMESPACE}"
+
+                                echo "Rollback pod status:"
+
+                                kubectl get pods \
+                                    -n "${K8S_NAMESPACE}" \
+                                    -l app=bankapp
+
+                                echo "AUTOMATIC ROLLBACK COMPLETED"
+                            """
+                        )
+
+                        if (rollbackStatus == 0) {
+                            echo """
+                            ==========================================
+                             AUTOMATIC ROLLBACK COMPLETED
+                            ==========================================
+                            Restored image: ${previousImage}
+                            ==========================================
+                            """
+                        } else {
+                            echo """
+                            ==========================================
+                             AUTOMATIC ROLLBACK FAILED
+                            ==========================================
+                             Manual investigation is required.
+                            ==========================================
+                            """
+                        }
+
                     } else {
-                        echo """
-                        ==========================================
-                         AUTOMATIC ROLLBACK FAILED
-                        ==========================================
-                        Manual investigation is required.
-                        ==========================================
-                        """
+                        echo 'Rollback skipped: previous image file is empty.'
                     }
 
                 } else {
