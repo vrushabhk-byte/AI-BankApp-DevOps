@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bankapp-monitoring-test
+  namespace: bankapp
+  labels:
+    app: bankapp-monitoring-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bankapp-monitoring-test
+  template:
+    metadata:
+      labels:
+        app: bankapp-monitoring-test
+    spec:
+      containers:
+        - name: bankapp
+          image: ai-bankapp:monitoring-test
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: MYSQL_HOST
+              value: mysql
+            - name: MYSQL_PORT
+              value: "3306"
+            - name: MYSQL_DATABASE
+              value: bankappdb
+            - name: MYSQL_USER
+              value: root
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bankapp-secrets
+                  key: MYSQL_ROOT_PASSWORD
+            - name: OLLAMA_URL
+              value: http://ollama:11434
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 90
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bankapp-monitoring-test
+  namespace: bankapp
+  labels:
+    app: bankapp-monitoring-test
+spec:
+  type: ClusterIP
+  selector:
+    app: bankapp-monitoring-test
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

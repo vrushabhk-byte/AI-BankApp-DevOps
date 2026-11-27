@@ -34,4 +34,27 @@ build/
 
 ### Claude ###
 CLAUDE.md
+
+### Environment and secrets ###
 .env
+.env.*
+!.env.example
+
+### Backups and generated reports ###
+*.backup
+*.bak
+Jenkinsfile.backup
+dependency-tree.txt
+trivy-fs-report.json
+trivy-image-report.json
+
+### Accidental local cache ###
+/~/
+
+### Terraform ###
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+terraform.tfvars.json
